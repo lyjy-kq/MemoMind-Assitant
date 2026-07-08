@@ -1,0 +1,27 @@
+# Build artifacts
+/final-agent
+/bin/
+/dist/
+*.test
+*.out
+.data/
+
+# IDE
+/.idea/
+/.vscode/
+
+# OS
+.DS_Store
+
+# Logs
+*.log
+
+# Local env overrides
+.env
+.env.local
+
+.codegraph
+
+AGI-SABER
+docs
+docx
