@@ -1,7 +1,7 @@
 // Package preference 用户偏好记忆。
 //
 // 以键值对形式存储用户偏好（姓名 / 喜好 / 城市 等结构化属性）。
-// 写入有两条通道：LLM NER 异步提取（准）+ 规则兜底同步提取（即时一致）。
+// 写入由上层统一完成：先用 ExtractPreferences 抽取，再异步写入此存储。
 //
 // 并发安全：所有公共方法持锁。直接读 .Data 字段（旧代码 / JSON 序列化）请用 Snapshot()。
 package preference
@@ -61,41 +61,6 @@ func (p *Preference) Snapshot() map[string]string {
 		cp[k] = v
 	}
 	return cp
-}
-
-// ExtractAndSave 从对话文本中用规则提取偏好（兜底，LLM 提取优先）
-func (p *Preference) ExtractAndSave(msg string) (key, value string, ok bool) {
-	if strings.Contains(msg, "我喜欢") {
-		parts := strings.SplitN(msg, "喜欢", 2)
-		if len(parts) == 2 && strings.TrimSpace(parts[1]) != "" {
-			key, value = "喜好", strings.TrimSpace(parts[1])
-			p.mu.Lock()
-			p.Data[key] = value
-			p.mu.Unlock()
-			return key, value, true
-		}
-	}
-	if strings.Contains(msg, "我爱") {
-		parts := strings.SplitN(msg, "爱", 2)
-		if len(parts) == 2 && strings.TrimSpace(parts[1]) != "" {
-			key, value = "喜好", strings.TrimSpace(parts[1])
-			p.mu.Lock()
-			p.Data[key] = value
-			p.mu.Unlock()
-			return key, value, true
-		}
-	}
-	if strings.Contains(msg, "我叫") {
-		parts := strings.SplitN(msg, "叫", 2)
-		if len(parts) == 2 && strings.TrimSpace(parts[1]) != "" {
-			key, value = "姓名", strings.TrimSpace(parts[1])
-			p.mu.Lock()
-			p.Data[key] = value
-			p.mu.Unlock()
-			return key, value, true
-		}
-	}
-	return "", "", false
 }
 
 // BuildContext 将偏好数据格式化为给 LLM 的上下文字符串

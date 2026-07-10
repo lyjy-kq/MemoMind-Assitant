@@ -68,7 +68,7 @@ func (a *ContextAssembler) Assemble(ctx context.Context, q Query) *RuntimeContex
 		schema = a.schemas["chat"]
 	}
 
-	rc := &RuntimeContext{
+	runCtx := &RuntimeContext{
 		Schema: schema,
 		Filled: make([]FilledSlot, len(schema.Slots)),
 	}
@@ -82,18 +82,18 @@ func (a *ContextAssembler) Assemble(ctx context.Context, q Query) *RuntimeContex
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			fs := a.fillSlot(ctx, slot, q)
+			fillSlot := a.fillSlot(ctx, slot, q)
 			mu.Lock()
-			rc.Filled[idx] = fs
+			runCtx.Filled[idx] = fillSlot
 			mu.Unlock()
 		}()
 	}
 	wg.Wait()
 
 	// 全局预算裁剪（高优先级槽位优先保留）
-	a.applyGlobalBudget(rc)
+	a.applyGlobalBudget(runCtx)
 
-	return rc
+	return runCtx
 }
 
 // fillSlot 调用注册到该 SlotKind 的 source，并做单槽位 budget 裁剪

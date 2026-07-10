@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"sort"
 )
 
 // ─────────────────────────── 公开入口 ───────────────────────────
@@ -92,18 +93,18 @@ type preparedRequest struct {
 // onEvent == nil → 非流式（不推送任何事件，但内部仍走完同一段逻辑）
 // onEvent != nil → 流式（在 route / step / token / tool_call / rag_result / done 等节点推送）
 func (a *UnifiedAgent) runOnce(ctx context.Context, query string, opts ChatOptions, onEvent func(StreamEvent)) *Response {
-	pr := a.prepare(ctx, query, opts)
+	pre := a.prepareAndSave(ctx, query, opts)
 
 	resp := &Response{
 		Query:         query,
-		Mode:          pr.mode,
-		ExtractedInfo: pr.extracted,
+		Mode:          pre.mode,
+		ExtractedInfo: pre.extracted,
 	}
 
-	if pr.extracted != "" {
-		emit(onEvent, "memory", map[string]string{"extracted_info": pr.extracted})
+	if pre.extracted != "" {
+		emit(onEvent, "memory", map[string]string{"extracted_info": pre.extracted})
 	}
-	emit(onEvent, "route", map[string]string{"mode": pr.mode})
+	emit(onEvent, "route", map[string]string{"mode": pre.mode})
 
 	// 检查 context 是否已取消（在分发前）
 	if ctx.Err() != nil {
@@ -113,7 +114,7 @@ func (a *UnifiedAgent) runOnce(ctx context.Context, query string, opts ChatOptio
 		return resp
 	}
 
-	a.dispatch(ctx, pr, resp, onEvent)
+	a.dispatch(ctx, pre, resp, onEvent)
 
 	if ctx.Err() != nil {
 		resp.Interrupted = true
@@ -125,9 +126,9 @@ func (a *UnifiedAgent) runOnce(ctx context.Context, query string, opts ChatOptio
 	return resp
 }
 
-// prepare 完成 STM 写入 / 偏好提取 / 路由 / 上下文装配 / 历史构建。
+// prepareAndSave 完成 STM 写入 / 偏好提取 / 路由 / 上下文装配 / 历史构建。
 // 不推任何事件——事件由 runOnce 统一推送，便于 finalize 控制顺序。
-func (a *UnifiedAgent) prepare(ctx context.Context, query string, opts ChatOptions) preparedRequest {
+func (a *UnifiedAgent) prepareAndSave(ctx context.Context, query string, opts ChatOptions) preparedRequest {
 	userID := usercontext.UserIDFromContext(ctx)
 	// 多租户：未登录请求所有 mem 写入都跳过——HTTP 层已经在 RequireAuth 中拦了，
 	// 这里再加一道防御应付未来 CLI / 测试入口忘传 ctx 的情况
@@ -142,72 +143,23 @@ func (a *UnifiedAgent) prepare(ctx context.Context, query string, opts ChatOptio
 		a.repos.chat.Save(userID, "user", query)
 	}
 
-	// 2. 偏好提取：优先 LLM（异步）+ 同步规则兜底（立即生效，回显给前端）。
-	// 安全策略：LLM 抽取出每个 k-v 后，单独过一次 poison gate；
-	// 命中 PII / Injection 直接 skip 并 log，不入 LTM 也不入图记忆。
-	if hasUser {
-		a.goSafe("process.preference-extract", func() {
-			// 对用户消息的检查，LLM 可能会被越狱，返回
-			//  PII 个人识别信息
-			// Injection 注入的越狱信息
-			// Ephemeral 短期
-			// Safe 安全
-			if pre := inspectMemoryContent(query); !pre.Safe() {
-				log.Printf("🛡️  [pref-extract] 整段拒绝：risk=%s reason=%s",
-					pre.Risk, pre.Reason)
-				return
-			}
-
-			kvs := a.llm.ExtractPreferences(query)
-			//没有偏好直接返回
-			if len(kvs) == 0 {
-				return
-			}
-			//偏好就保存到内存中
-			a.mem.Pref(userID).SaveBatch(kvs)
-			for k, v := range kvs {
-				// 单条 k-v 复检
-				if insp := inspectKVPair(k, v); !insp.Safe() {
-					log.Printf("🛡️  [pref-extract] 拒绝写入 k=%q: risk=%s reason=%s",
-						k, insp.Risk, insp.Reason)
-					continue
-				}
-				//这一条没问题就保存到数据库中
-				a.repos.pref.Save(userID, k, v)
-				// 把结构化 kv 拼成一条可入记忆的自然语言文本。
-				// 之所以先拼接再审查，是因为后续要写入的图记忆和长期记忆，
-				// 存的都是最终文本形态，而不是拆开的 k/v 片段。
-				content := fmt.Sprintf("用户%s: %s", k, v)
-				if insp := inspectMemoryContent(content); !insp.Safe() {
-					log.Printf("🛡️  [pref-extract] 拼接后命中：risk=%s", insp.Risk)
-					continue
-				}
-				// 先对最终文本做 embedding，得到用于相似度、去重和图召回的向量。
-				emb, _ := a.llm.Embed(content)
-				// GraphMemory.Store 先在内存长期记忆里做去重判断：
-				//   - added=true 表示这条内容是新记忆，需要继续落库
-				//   - added=false 表示已存在相似记忆，不再重复写图节点和 PG 记录
-				// 这一步不是查数据库，而是查当前进程内的 LongTerm.Items。
-				if added, _ := a.mem.graphMem.Store(userID, content, 0.8, emb); added {
-					// 只有确认是新记忆时，才把 embedding 序列化后写入 PostgreSQL。
-					// 这样可以避免重复插入，并保证 PG 与内存图看到的是同一条新增记忆。
-					embJSON, _ := json.Marshal(emb)
-					// LTM 仓储返回数据库自增 ID；这个 ID 后面要回填到刚写入的
-					// LongTerm / GraphMemory 条目里，保证内存 ID 与 PGID 对齐。
-					pgID := a.repos.ltm.Save(userID, content, 0.8, embJSON)
-					// 回填 PGID 后，图记忆和长期记忆都能引用同一个持久化 ID，
-					// 便于后续召回、合并、审计和图节点同步。
-					a.mem.graphMem.SyncLastItemPGID(pgID)
-				}
-			}
-		})
-	}
-
+	// 2. 偏好提取：同步提取一份 kvs，同时用于前端回显与异步持久化。
+	// 安全策略保持不变：整段 query 先过一次检查；正式落库前每条 k-v 再复检。
 	var extracted string
-	// 同步规则兜底：未登录跳过
 	if hasUser {
-		if key, value, ok := a.mem.Pref(userID).ExtractAndSave(query); ok {
-			extracted = fmt.Sprintf("已记住：%s = %s", key, value)
+		// 对用户消息先做整段检查，避免为高风险内容触发 LLM 抽取。
+		if pre := inspectMemoryContent(query); !pre.Safe() {
+			log.Printf("🛡️  [pref-extract] 整段拒绝：risk=%s reason=%s",
+				pre.Risk, pre.Reason)
+		} else {
+			kvs := a.llm.ExtractPreferences(query)
+			extracted = formatExtractedPreferences(kvs)
+			if len(kvs) > 0 {
+				// 异步持久化复用同一批提取结果，避免再次调用 ExtractPreferences。
+				a.goSafe("process.preference-extract", func() {
+					a.persistExtractedPreferences(userID, kvs)
+				})
+			}
 		}
 	}
 
@@ -225,6 +177,84 @@ func (a *UnifiedAgent) prepare(ctx context.Context, query string, opts ChatOptio
 		memPrefix:  memPrefix,
 		histMsgs:   histMsgs,
 		extracted:  extracted,
+	}
+}
+
+// formatExtractedPreferences 把偏好 kvs 格式化为稳定顺序的“已记住”回显文案。
+func formatExtractedPreferences(kvs map[string]string) string {
+	if len(kvs) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(kvs))
+	for k := range kvs {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		parts = append(parts, fmt.Sprintf("%s = %s", k, kvs[k]))
+	}
+	return "已记住：" + joinWithChineseSemicolon(parts)
+}
+
+// joinWithChineseSemicolon 用中文分号拼接多条回显片段。
+func joinWithChineseSemicolon(parts []string) string {
+	if len(parts) == 0 {
+		return ""
+	}
+	out := parts[0]
+	for i := 1; i < len(parts); i++ {
+		out += "；" + parts[i]
+	}
+	return out
+}
+
+// persistExtractedPreferences 把一批已提取的偏好异步写入 Pref / PG / LTM。
+func (a *UnifiedAgent) persistExtractedPreferences(userID string, kvs map[string]string) {
+	// 先把提取结果写入用户偏好内存桶，供本进程后续上下文装配直接读取。
+	a.mem.Pref(userID).SaveBatch(kvs)
+	for k, v := range kvs {
+		// 单条 k-v 复检
+		if insp := inspectKVPair(k, v); !insp.Safe() {
+			log.Printf("🛡️  [pref-extract] 拒绝写入 k=%q: risk=%s reason=%s",
+				k, insp.Risk, insp.Reason)
+			continue
+		}
+		// 这一条没问题就保存到数据库中
+		a.repos.pref.Save(userID, k, v)
+		// 把结构化 kv 拼成一条可入记忆的自然语言文本。
+		// 之所以先拼接再审查，是因为后续要写入的图记忆和长期记忆，
+		// 存的都是最终文本形态，而不是拆开的 k/v 片段。
+		content := fmt.Sprintf("用户%s: %s", k, v)
+		if insp := inspectMemoryContent(content); !insp.Safe() {
+			log.Printf("🛡️  [pref-extract] 拼接后命中：risk=%s", insp.Risk)
+			continue
+		}
+		// 先对最终文本做 embedding，得到用于相似度、去重和图召回的向量。
+		emb, _ := a.llm.Embed(content)
+		// GraphMemory.Store 先在内存长期记忆里做去重判断：
+		//   - added=true 表示这条内容是新记忆，需要继续落库
+		//   - added=false 表示已存在相似记忆，不再重复写图节点和 PG 记录
+		// 这一步不是查数据库，而是查当前进程内的 LongTerm.Items。
+		if a.mem.graphMem != nil {
+			if added, _ := a.mem.graphMem.Store(userID, content, 0.8, emb); added {
+				// 只有确认是新记忆时，才把 embedding 序列化后写入 PostgreSQL。
+				// 这样可以避免重复插入，并保证 PG 与内存图看到的是同一条新增记忆。
+				embJSON, _ := json.Marshal(emb)
+				// LTM 仓储返回数据库自增 ID；这个 ID 后面要回填到刚写入的
+				// LongTerm / GraphMemory 条目里，保证内存 ID 与 PGID 对齐。
+				pgID := a.repos.ltm.Save(userID, content, 0.8, embJSON)
+				// 回填 PGID 后，图记忆和长期记忆都能引用同一个持久化 ID，
+				// 便于后续召回、合并、审计和图节点同步。
+				a.mem.graphMem.SyncLastItemPGID(pgID)
+			}
+			continue
+		}
+		if a.mem.ltm.StoreClassified(userID, content, 0.8, emb, "general", nil, "") {
+			embJSON, _ := json.Marshal(emb)
+			newID := a.repos.ltm.SaveClassified(userID, content, 0.8, embJSON, "general", nil, "")
+			a.mem.ltm.SyncLastItemPGID(newID)
+		}
 	}
 }
 
